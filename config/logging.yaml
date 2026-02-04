@@ -1,0 +1,9 @@
+logging:
+  level: "INFO"
+  format: "csv"      # jsonl / csv
+  save_config_snapshot: true
+  save_git_info: true
+  files:
+    app_log: "logs/app.jsonl"
+    trades_log: "logs/trades.csv"
+    metrics_log: "logs/metrics.jsonl"

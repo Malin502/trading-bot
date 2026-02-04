@@ -1,0 +1,10 @@
+risk:
+  stop_loss:
+    enabled: true
+    type: "rate"
+    value: 0.02       # -2%で損切りの例
+  take_profit:
+    enabled: true
+    type: "rate"
+    value: 0.03       # +3%で利確の例
+  max_holding_bars: 24  # 10分足なら 24=4時間、1日なら日数になる

@@ -1,0 +1,7 @@
+data:
+  bar_type: "10min"   # ローソク足の種類 (例: 1min, 5min, 10min, 1h, 1d)
+  lookback_days: 180  # 特徴量生成に使う過去期間
+  source: "yfinance"  # データ取得元
+  refresh:
+    enabled: true
+    schedule: "manual"  # manual / cron

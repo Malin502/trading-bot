@@ -1,0 +1,8 @@
+runtime:
+  mode: "backtest"  # backtest / paper / live
+  device: "auto"    # auto / cpu / cuda
+  num_workers: 4
+
+  safety:
+    dry_run: true
+    allow_short: false

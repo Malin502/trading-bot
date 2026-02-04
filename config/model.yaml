@@ -1,0 +1,21 @@
+model:
+  kind: "transformer"   # xgboost / lightgbm / transformer
+  target:
+    horizon_bars: 1         # 次の足が上がるか
+    label: "up_down"        # up_down / return_regression
+
+  features:
+    technical:
+      enabled: true
+      indicators:
+        - "rsi"
+        - "macd"
+        - "bbands"
+        - "atr"
+    lag:
+      enabled: true
+      lags: [1, 2, 3, 6, 12]
+
+  train:
+    split: "walk_forward"
+    seed: 42

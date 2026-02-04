@@ -1,0 +1,23 @@
+strategy:
+  decision_timing:
+    mode: "once_per_day"  # intraday_multi / once_per_day
+    # once_per_dayの例: "15:00"に判断して翌日寄りで買う…など
+    daily_cutoff_time: "15:00"
+
+  selection:
+    score: "prob_up"         # 例: prob_up / expected_return / custom
+    threshold: 0.6
+    max_positions: 5         # 同時保有上限
+    order: "desc"            # score の高い順
+
+  allocation:
+    method: "equal_weight"   # equal_weight / fixed_amount / risk_parity(後で)
+    cash_buffer_rate: 0.0    # 余力を残すなら 0.05 とか
+
+  execution:
+    buy:
+      type: "market"         # market / limit
+      limit_offset_rate: 0.0
+    sell:
+      type: "market"
+      limit_offset_rate: 0.0

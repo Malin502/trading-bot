@@ -1,0 +1,10 @@
+costs:
+  fee:
+    type: "rate"      # rate / fixed
+    value: 0.001      # 0.1% (売買ごと)
+  slippage:
+    type: "rate"
+    value: 0.001     # 0.1% (売買ごと)
+  tax:
+    enabled: false    # バックテストで税を入れたくなったら true
+    rate: 0.20315

@@ -1,0 +1,4 @@
+universe:
+  role: "train"
+  name: "TOPIX500"
+  snapshot_path: "./data/universe/topix500_20260201.csv"
