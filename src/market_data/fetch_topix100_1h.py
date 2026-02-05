@@ -17,7 +17,7 @@ def normalize_intraday_15m(df: pd.DataFrame) -> pd.DataFrame:
     """
     yfinance history() の結果を、
     - indexをJSTへ統一
-    - 15分床丸め
+    - 1時間床丸め
     - 重複除去（last）
     - 必要列のみ(Open/High/Low/Close/Volume)
     に正規化する
@@ -37,8 +37,8 @@ def normalize_intraday_15m(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df.index = df.index.tz_convert(TZ)
 
-    # 15分に床丸め（時刻ズレ吸収）
-    df.index = df.index.floor("15min")
+    # 1時間に床丸め（時刻ズレ吸収）
+    df.index = df.index.floor("1h")
 
     # 重複除去（同一timestampは最後を採用）
     df = df[~df.index.duplicated(keep="last")].sort_index()
@@ -56,7 +56,7 @@ def normalize_intraday_15m(df: pd.DataFrame) -> pd.DataFrame:
 def slice_to_1500_jst(df: pd.DataFrame) -> pd.DataFrame:
     """
     全期間について「各営業日 09:00〜15:00（15:00含む）」だけ残す。
-    15:15が混ざる問題を恒久的に排除する。
+    15:00以降が混ざる問題を恒久的に排除する。
     """
     if df.empty:
         return df
@@ -81,7 +81,7 @@ def slice_to_1500_jst(df: pd.DataFrame) -> pd.DataFrame:
 
 def upsert_parquet_monthly(out_dir: Path, symbol: str, df: pd.DataFrame) -> None:
     """
-    clean/{symbol}/intraday_15m_YYYY-MM.parquet に月単位で追記（重複はlastで潰す）
+    clean/{symbol}/intraday_1h_YYYY-MM.parquet に月単位で追記（重複はlastで潰す）
     """
     if df.empty:
         return
@@ -90,44 +90,45 @@ def upsert_parquet_monthly(out_dir: Path, symbol: str, df: pd.DataFrame) -> None
     sym_dir.mkdir(parents=True, exist_ok=True)
 
     # 月ごとに分割して保存
-    # to_period("M") は tz付きでもOK
-    for m, df_m in df.groupby(df.index.to_period("M")):
-        yyyy_mm = str(m)  # "2026-02"
-        path = sym_dir / f"intraday_15m_{yyyy_mm}.parquet"
+    # to_period("M") は tz付きでもOK (警告は無視して問題なし)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for m, df_m in df.groupby(df.index.to_period("M")):
+            yyyy_mm = str(m)  # "2026-02"
+            path = sym_dir / f"intraday_1h_{yyyy_mm}.parquet"
 
-        if path.exists():
-            old = pd.read_parquet(path)
+            if path.exists():
+                old = pd.read_parquet(path)
 
-            # 旧データのtzが落ちてたら補正
-            if isinstance(old.index, pd.DatetimeIndex):
-                if old.index.tz is None:
-                    old.index = old.index.tz_localize(TZ)
-                else:
-                    old.index = old.index.tz_convert(TZ)
+                # 旧データのtzが落ちてたら補正
+                if isinstance(old.index, pd.DatetimeIndex):
+                    if old.index.tz is None:
+                        old.index = old.index.tz_localize(TZ)
+                    else:
+                        old.index = old.index.tz_convert(TZ)
 
-            merged = pd.concat([old, df_m], axis=0)
-        else:
-            merged = df_m
+                merged = pd.concat([old, df_m], axis=0)
+            else:
+                merged = df_m
 
-        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-        merged.to_parquet(path)
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+            merged.to_parquet(path)
 
 
-# ---------- 取得（60d制限を4回回して240d相当） ----------
+# ---------- 取得（上限730d） ----------
 
 @dataclass
 class FetchConfig:
-    interval: str = "15m"
-    chunk_period: str = "60d"   # yfinanceの上限に合わせる
-    chunks: int = 1             # 30d × 8 = 240d
-    step_days: int = 30         # endを過去へずらす幅（概ねでOK）
-    sleep_sec: float = 0.8
+    interval: str = "1h"
+    chunk_period: str = "730d"   # yfinanceの上限に合わせる
+    sleep_sec: float = 1.0
     max_retries: int = 3
 
 
-def fetch_chunk(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
+def fetch(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
     """
-    end_dt を基準に period=60d, interval=15m のチャンクを取る
+    end_dt を基準に period=730d, interval=1h のチャンクを取る
     """
     last_err: Optional[Exception] = None
 
@@ -144,7 +145,6 @@ def fetch_chunk(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -
             df = t.history(
                 period=cfg.chunk_period,
                 interval=cfg.interval,
-                end=end_str,
                 auto_adjust=False
             )
             return df
@@ -155,9 +155,9 @@ def fetch_chunk(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -
     raise RuntimeError(f"fetch failed: {symbol} end={end_str}") from last_err
 
 
-def fetch_and_save_240d(symbols: Iterable[str], out_clean_dir: str = "data/clean") -> None:
+def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean") -> None:
     """
-    symbols（.T付き）を対象に、60d×4回で約240日分を取得して保存する
+    symbols（.T付き）を対象に、730dまでのデータを取得して保存する
     """
     cfg = FetchConfig()
     out_clean = Path(out_clean_dir)
@@ -172,17 +172,15 @@ def fetch_and_save_240d(symbols: Iterable[str], out_clean_dir: str = "data/clean
         try:
             all_parts = []
 
-            for k in range(cfg.chunks):
-                end_dt = now_jst - pd.Timedelta(days=cfg.step_days * k)
-                raw = fetch_chunk(sym, cfg, end_dt=end_dt)
+            raw = fetch(sym, cfg, end_dt=now_jst)
 
-                part = normalize_intraday_15m(raw)
-                part = slice_to_1500_jst(part)  # 15:15などを全期間で排除
+            part = normalize_intraday_15m(raw)
+            part = slice_to_1500_jst(part)  # 15:15などを全期間で排除
 
-                if not part.empty:
-                    all_parts.append(part)
+            if not part.empty:
+                all_parts.append(part)
 
-                time.sleep(cfg.sleep_sec)
+            time.sleep(cfg.sleep_sec)
 
             if all_parts:
                 df = pd.concat(all_parts, axis=0)
@@ -213,4 +211,4 @@ if __name__ == "__main__":
     topix100 = extract_topix_codes()
     print(f"取得したコード数: {len(topix100)}")
 
-    fetch_and_save_240d(topix100, out_clean_dir="data/clean")
+    fetch_and_save_730d(topix100, out_clean_dir="data/clean")
