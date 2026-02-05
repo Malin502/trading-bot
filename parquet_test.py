@@ -1,7 +1,7 @@
 import pandas as pd
 
 # ファイルを読み込む
-df = pd.read_parquet('data/clean/1925.T/intraday_15m_2025-02.parquet')
+df = pd.read_parquet('features/1925.T/features_1h_for_ae.parquet')
 
 # 先頭を表示
 print(df.tail())

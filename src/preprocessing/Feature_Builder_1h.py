@@ -11,7 +11,7 @@ import pandas as pd
 
 # Add project root to Python path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.market_data.code_extractor import extract_topix_codes
+from src.market_data.CodeExtractor import extract_topix_codes
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PREP_ROOT = PROJECT_ROOT / "data" / "preprocessing"
@@ -99,26 +99,34 @@ def _compute_candle_features(df: pd.DataFrame) -> pd.DataFrame:
 def _align_and_add_market_diffs(
     feat_stock: pd.DataFrame, feat_mkt: pd.DataFrame
 ) -> pd.DataFrame:
-    # We only need market columns to compute relative features
     need = ["r", "vol", "v_rel"]
     for col in need:
         if col not in feat_mkt.columns:
             raise ValueError(f"Market features missing: {col}")
 
+    # --- NEW: align market to stock timestamps ---
+    mkt = feat_mkt[need].copy()
+    mkt = mkt.reindex(feat_stock.index)
+
+    # --- NEW: forward-fill ONLY within the same date (prevents cross-day leakage) ---
+    # If market has missing at some timestamps, fill with earlier timestamp of the same day
+    mkt["date"] = mkt.index.date
+    mkt[need] = mkt.groupby("date")[need].ffill()
+    mkt = mkt.drop(columns=["date"])
+
     joined = feat_stock.join(
-        feat_mkt[need].rename(
-            columns={"r": "r_mkt", "vol": "vol_mkt", "v_rel": "v_rel_mkt"}
-        ),
+        mkt.rename(columns={"r": "r_mkt", "vol": "vol_mkt", "v_rel": "v_rel_mkt"}),
         how="inner",
     )
+
+    # If still NaNs remain (e.g., day-start missing), drop those rows
+    joined = joined.dropna(subset=["r_mkt", "vol_mkt", "v_rel_mkt"])
 
     joined["rel_r"] = joined["r"] - joined["r_mkt"]
     joined["rel_vol"] = joined["vol"] - joined["vol_mkt"]
     joined["rel_v"] = joined["v_rel"] - joined["v_rel_mkt"]
 
-    # Drop market helper cols (keep only what AE needs)
-    joined = joined.drop(columns=["r_mkt", "vol_mkt", "v_rel_mkt"])
-    return joined
+    return joined.drop(columns=["r_mkt", "vol_mkt", "v_rel_mkt"])
 
 
 def _fit_scaler(train_df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
@@ -146,53 +154,53 @@ def _save_features(ticker: str, df_feat: pd.DataFrame) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     fp = out_dir / "features_1h_for_ae.parquet"
     df_feat.to_parquet(fp)
+    
+def _fit_global_scaler(feat_by_ticker: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[float, float]]:
+    # concat train slices across tickers
+    trains = []
+    for tkr, feat in feat_by_ticker.items():
+        n = len(feat)
+        if n < 200:
+            continue
+        split = int(n * 0.7)
+        trains.append(feat.iloc[:split])
+    if not trains:
+        raise ValueError("No sufficient data to fit global scaler.")
+    train_all = pd.concat(trains, axis=0)
+    return _fit_scaler(train_all)
 
 
 def main():
     tickers = list(extract_topix_codes())[:100]
-    # Ensure market ticker is also processed
-    if MARKET_TICKER not in tickers:
-        # it can be outside TOPIX100; we still need it
-        tickers_with_market = tickers + [MARKET_TICKER]
-    else:
-        tickers_with_market = tickers
 
-    # Load market OHLCV and compute its features once
+    market_fp = PREP_ROOT / MARKET_TICKER / "intraday_1h_preprocessed.parquet"
+    if not market_fp.exists():
+        raise FileNotFoundError(f"Market ticker preprocessed file not found: {market_fp}")
+
     df_mkt_ohlcv = _read_preprocessed_ohlcv(MARKET_TICKER)
-    feat_mkt = _compute_candle_features(df_mkt_ohlcv)
+    feat_mkt = _compute_candle_features(df_mkt_ohlcv).dropna()
 
-    # We need rolling windows; drop initial NaNs in market
-    feat_mkt = feat_mkt.dropna()
-
-    # Choose a simple train slice for scaling:
-    # Fit scaler on the earliest 70% of available timestamps (time-based, no shuffle)
-    # (You can later replace with walk-forward.)
+    # --- NEW: first pass build features for all tickers (unscaled) ---
+    feat_map: Dict[str, pd.DataFrame] = {}
     for i, tkr in enumerate(tickers, 1):
         df_ohlcv = _read_preprocessed_ohlcv(tkr)
-        feat = _compute_candle_features(df_ohlcv)
-        feat = feat.dropna()
-
-        # Add market-relative features (inner join on timestamps)
+        feat = _compute_candle_features(df_ohlcv).dropna()
         feat = _align_and_add_market_diffs(feat, feat_mkt)
+        feat_map[tkr] = feat
+        print(f"[PASS1 {i:03d}/{len(tickers)}] {tkr} rows={len(feat)}")
 
-        # Fit scaler on first 70% timestamps for THIS ticker (keeps things stable for AE)
-        # If you prefer global scaler across all tickers, tell me and I'll rewrite.
-        n = len(feat)
-        if n < 200:
-            # too short -> still save unscaled for debugging
-            print(f"[{i:03d}/{len(tickers)}] WARN {tkr}: too few rows ({n}), saving unscaled")
-            _save_features(tkr, feat)
-            continue
+    # --- NEW: fit one global scaler ---
+    global_scaler = _fit_global_scaler(feat_map)
 
-        split = int(n * 0.7)
-        train_slice = feat.iloc[:split]
-        scaler = _fit_scaler(train_slice)
-        feat_scaled = _apply_scaler(feat, scaler)
-
+    # --- NEW: second pass apply global scaler and save ---
+    for i, tkr in enumerate(tickers, 1):
+        feat = feat_map[tkr]
+        feat_scaled = _apply_scaler(feat, global_scaler)
         _save_features(tkr, feat_scaled)
-        print(f"[{i:03d}/{len(tickers)}] OK  {tkr} rows={n} cols={feat_scaled.shape[1]}")
+        print(f"[PASS2 {i:03d}/{len(tickers)}] OK {tkr} rows={len(feat_scaled)} cols={feat_scaled.shape[1]}")
 
     print("Done.")
+
 
 
 if __name__ == "__main__":
