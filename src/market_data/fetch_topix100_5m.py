@@ -13,11 +13,11 @@ TZ = "Asia/Tokyo"
 
 # ---------- 正規化 / クリーニング ----------
 
-def normalize_intraday_1h(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_intraday_5m(df: pd.DataFrame) -> pd.DataFrame:
     """
     yfinance history() の結果を、
     - indexをJSTへ統一
-    - 1時間床丸め
+    - 5分床丸め
     - 重複除去（last）
     - 必要列のみ(Open/High/Low/Close/Volume)
     に正規化する
@@ -37,8 +37,8 @@ def normalize_intraday_1h(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df.index = df.index.tz_convert(TZ)
 
-    # 1時間に床丸め（時刻ズレ吸収）
-    df.index = df.index.floor("1h")
+    # 5分に床丸め（時刻ズレ吸収）
+    df.index = df.index.floor("5min")
 
     # 重複除去（同一timestampは最後を採用）
     df = df[~df.index.duplicated(keep="last")].sort_index()
@@ -81,7 +81,7 @@ def slice_to_1500_jst(df: pd.DataFrame) -> pd.DataFrame:
 
 def upsert_parquet_monthly(out_dir: Path, symbol: str, df: pd.DataFrame) -> None:
     """
-    clean/{symbol}/intraday_1h_YYYY-MM.parquet に月単位で追記（重複はlastで潰す）
+    clean/{symbol}/intraday_5m_YYYY-MM.parquet に月単位で追記（重複はlastで潰す）
     """
     if df.empty:
         return
@@ -96,7 +96,7 @@ def upsert_parquet_monthly(out_dir: Path, symbol: str, df: pd.DataFrame) -> None
         warnings.simplefilter("ignore", UserWarning)
         for m, df_m in df.groupby(df.index.to_period("M")):
             yyyy_mm = str(m)  # "2026-02"
-            path = sym_dir / f"intraday_1h_{yyyy_mm}.parquet"
+            path = sym_dir / f"intraday_5m_{yyyy_mm}.parquet"
 
             if path.exists():
                 old = pd.read_parquet(path)
@@ -120,15 +120,15 @@ def upsert_parquet_monthly(out_dir: Path, symbol: str, df: pd.DataFrame) -> None
 
 @dataclass
 class FetchConfig:
-    interval: str = "1h"
-    chunk_period: str = "730d"   # yfinanceの上限に合わせる
+    interval: str = "5m"
+    chunk_period: str = "60d"   # yfinanceの上限に合わせる
     sleep_sec: float = 1.0
     max_retries: int = 3
 
 
 def fetch(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
     """
-    end_dt を基準に period=730d, interval=1h のチャンクを取る
+    end_dt を基準に period=60d, interval=5m のチャンクを取る
     """
     last_err: Optional[Exception] = None
 
@@ -155,9 +155,9 @@ def fetch(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -> pd.D
     raise RuntimeError(f"fetch failed: {symbol} end={end_str}") from last_err
 
 
-def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean") -> None:
+def fetch_and_save_60d(symbols: Iterable[str], out_clean_dir: str = "data/clean") -> None:
     """
-    symbols（.T付き）を対象に、730dまでのデータを取得して保存する
+    symbols（.T付き）を対象に、60dまでのデータを取得して保存する
     """
     cfg = FetchConfig()
     out_clean = Path(out_clean_dir)
@@ -174,7 +174,7 @@ def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean
 
             raw = fetch(sym, cfg, end_dt=now_jst)
 
-            part = normalize_intraday_1h(raw)
+            part = normalize_intraday_5m(raw)
             part = slice_to_1500_jst(part)  # 15:15などを全期間で排除
 
             if not part.empty:
@@ -201,7 +201,7 @@ def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean
 
 # -------- 使い方 --------
 # topix100 = ["7203.T", "6758.T", ...]  # もう.T付きのリスト
-# fetch_and_save_240d(topix100, out_clean_dir="data/clean")
+# fetch_and_save_60d(topix100, out_clean_dir="data/clean")
 
 if __name__ == "__main__":
     # テスト用コード抽出・取得実行
@@ -211,4 +211,4 @@ if __name__ == "__main__":
     topix100 = extract_topix_codes()
     print(f"取得したコード数: {len(topix100)}")
 
-    fetch_and_save_730d(topix100, out_clean_dir="data/clean")
+    fetch_and_save_60d(topix100, out_clean_dir="data/clean")
