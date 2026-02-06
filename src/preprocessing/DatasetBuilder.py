@@ -21,6 +21,8 @@ OUT_ROOT = PROJECT_ROOT / "datasets" / "intraday_1h_ae"
 
 MARKET_TICKER = "1306.T"
 
+BASE_RET = 0.03  # 3% target return
+
 N_BARS = 56 # 7 BARS_PER_DAY × 8 days
 BARS_PER_DAY = 7
 STRIDE_DAYS = 1
@@ -119,15 +121,27 @@ def _build_samples_for_ticker(ticker: str) -> pd.DataFrame:
         if window.isna().any().any():
             continue
 
-        # Label: next day Close (daily last bar) - today Close (daily last bar) > 0
-        # Today close at its daily last bar
-        end_ts_px = last_px.loc[d]
-        close_today = float(ohlcv.loc[end_ts_px, "Close"]) if end_ts_px in ohlcv.index else np.nan
-        close_next = float(ohlcv.loc[end_ts_next, "Close"]) if end_ts_next in ohlcv.index else np.nan
-        if not np.isfinite(close_today) or not np.isfinite(close_next):
+        # 今日の終値（基準価格）
+        end_ts_px = last_px.loc[d]  # 今日の「日次最後足」のtimestamp
+        if end_ts_px not in ohlcv.index:
+            continue
+        close_today = float(ohlcv.loc[end_ts_px, "Close"])
+        if not np.isfinite(close_today) or close_today <= 0:
             continue
 
-        y = 1 if (close_next - close_today) > 0 else 0
+        # 翌日のOHLCV（その日の全時間足）
+        # ※ last_px は「日次最後足」だが、Highを見るために日付で切る
+        next_date = pd.Timestamp(d_next)
+        mask_next_day = (ohlcv.index.date == next_date.date())
+        day_next = ohlcv.loc[mask_next_day]
+        if len(day_next) == 0:
+            continue
+
+        high_next_day = float(day_next["High"].max())
+        target_price = close_today * (1.0 + BASE_RET)
+
+        # ラベル：翌日中に +3% 到達したら 1
+        y = 1 if high_next_day >= target_price else 0
 
         rows.append(
             {
@@ -182,6 +196,14 @@ def main():
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     tickers = list(extract_topix_codes())[:100]
+
+    # 1306.T を必ず含める（末尾に追加 → 重複排除）
+    if MARKET_TICKER not in tickers:
+        tickers.append(MARKET_TICKER)
+
+    # 念のため重複排除（順序保持）
+    seen = set()
+    tickers = [t for t in tickers if not (t in seen or seen.add(t))]
 
     # Build samples for all tickers
     all_samples = []

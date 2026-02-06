@@ -121,3 +121,27 @@ def find_best_threshold(
 
     assert best_m is not None
     return best_thr, best_m
+def threshold_report(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    grid: np.ndarray | None = None
+) -> list[dict]:
+    """
+    Return list of metrics for each threshold in grid.
+    """
+    if grid is None:
+        grid = np.linspace(0.05, 0.95, 19)
+
+    rows = []
+    for thr in grid:
+        m = compute_metrics(y_true, y_prob, thr=float(thr))
+        rows.append({
+            "thr": float(thr),
+            "precision": float(m["precision"]),
+            "recall": float(m["recall"]),
+            "f1": float(m["f1"]),
+            "acc": float(m["acc"]),
+            "tp": int(m["tp"]), "fp": int(m["fp"]), "tn": int(m["tn"]), "fn": int(m["fn"]),
+        })
+    return rows

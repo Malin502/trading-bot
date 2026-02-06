@@ -1,7 +1,7 @@
 import pandas as pd
 
 # ファイルを読み込む
-df = pd.read_parquet('features/1925.T/features_1h_for_ae.parquet')
+df = pd.read_parquet('datasets/intraday_1h_ae/latent32.parquet')
 
 # 先頭を表示
 print(df.tail())
@@ -11,3 +11,5 @@ print(df.info())
 
 # 統計情報
 print(df.describe())
+
+print(df.columns.tolist())

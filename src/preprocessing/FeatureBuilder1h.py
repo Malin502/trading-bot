@@ -1,6 +1,6 @@
 # build_features_1h_for_ae.py
 from __future__ import annotations
-
+import json
 import math
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -16,6 +16,10 @@ from src.market_data.CodeExtractor import extract_topix_codes
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PREP_ROOT = PROJECT_ROOT / "data" / "preprocessing"
 FEATURES_ROOT = PROJECT_ROOT / "features"
+SCHEMA_DIR = FEATURES_ROOT / "_schema"
+SCHEMA_DIR.mkdir(parents=True, exist_ok=True)
+AE_SCHEMA_FP = SCHEMA_DIR / "ae_1h_feature_cols.json"
+
 MARKET_TICKER = "1306.T"
 
 REQ_COLS = ["Open", "High", "Low", "Close", "Volume"]
@@ -25,6 +29,19 @@ K_VOL = 20      # for return volatility
 K_VREL = 20     # for volume relative
 EPS = 1e-12
 
+
+def _load_or_create_feature_cols(example_feat) -> list[str]:
+    if AE_SCHEMA_FP.exists():
+        cols = json.loads(AE_SCHEMA_FP.read_text(encoding="utf-8"))
+        return cols
+
+    cols = list(example_feat.columns)
+    if len(cols) != 11:
+        raise ValueError(f"Expected 11 feature columns, but got {len(cols)}: {cols}")
+
+    AE_SCHEMA_FP.write_text(json.dumps(cols, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[SCHEMA] Saved AE feature cols ({len(cols)}): {AE_SCHEMA_FP}")
+    return cols
 
 def _read_preprocessed_ohlcv(ticker: str) -> pd.DataFrame:
     fp = PREP_ROOT / ticker / "intraday_1h_preprocessed.parquet"
@@ -172,6 +189,7 @@ def _fit_global_scaler(feat_by_ticker: Dict[str, pd.DataFrame]) -> Dict[str, Tup
 
 def main():
     tickers = list(extract_topix_codes())[:100]
+    tickers_with_market = list(dict.fromkeys(tickers + ["1306.T"]))  # 重複排除
 
     market_fp = PREP_ROOT / MARKET_TICKER / "intraday_1h_preprocessed.parquet"
     if not market_fp.exists():
@@ -182,22 +200,45 @@ def main():
 
     # --- NEW: first pass build features for all tickers (unscaled) ---
     feat_map: Dict[str, pd.DataFrame] = {}
-    for i, tkr in enumerate(tickers, 1):
-        df_ohlcv = _read_preprocessed_ohlcv(tkr)
-        feat = _compute_candle_features(df_ohlcv).dropna()
-        feat = _align_and_add_market_diffs(feat, feat_mkt)
+    skipped = []
+
+    for i, tkr in enumerate(tickers_with_market, 1):
+        try:
+            df_ohlcv = _read_preprocessed_ohlcv(tkr)
+            feat = _compute_candle_features(df_ohlcv).dropna()
+
+            feat_map[tkr] = feat
+            print(f"[PASS1 {i:03d}/{len(tickers_with_market)}] {tkr} rows={len(feat)}")
+
+        except Exception as e:
+            skipped.append({"ticker": tkr, "error": repr(e)})
+            print(f"[PASS1 {i:03d}/{len(tickers_with_market)}] SKIP {tkr} err={repr(e)}")
+
+    if MARKET_TICKER not in feat_map:
+        raise RuntimeError(f"{MARKET_TICKER} was skipped. Cannot proceed.")
+
+    print("Skipped:", skipped[:5], f"... total={len(skipped)}")
+    
+    # schema（最初の1銘柄で決める）
+    example_tkr = next(iter(feat_map.keys()))
+    FEATURE_COLS = _load_or_create_feature_cols(feat_map[example_tkr])
+
+    # 全銘柄を同じ列・同じ順序に固定
+    for tkr in list(feat_map.keys()):
+        feat = feat_map[tkr].reindex(columns=FEATURE_COLS)
+        if feat.isna().any().any():
+            raise ValueError(f"NaN after reindex for {tkr}. Check feature generation.")
         feat_map[tkr] = feat
-        print(f"[PASS1 {i:03d}/{len(tickers)}] {tkr} rows={len(feat)}")
 
     # --- NEW: fit one global scaler ---
     global_scaler = _fit_global_scaler(feat_map)
 
     # --- NEW: second pass apply global scaler and save ---
-    for i, tkr in enumerate(tickers, 1):
+    for i, tkr in enumerate(feat_map.keys(), 1):
         feat = feat_map[tkr]
         feat_scaled = _apply_scaler(feat, global_scaler)
         _save_features(tkr, feat_scaled)
-        print(f"[PASS2 {i:03d}/{len(tickers)}] OK {tkr} rows={len(feat_scaled)} cols={feat_scaled.shape[1]}")
+        print(f"[PASS2 {i:03d}/{len(feat_map)}] OK {tkr} rows={len(feat_scaled)} cols={feat_scaled.shape[1]}")
 
     print("Done.")
 
