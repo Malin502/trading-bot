@@ -1,286 +1,329 @@
-# build_dataset_manifest_1h.py
 from __future__ import annotations
-import sys
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
-# Add project root to Python path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.market_data.CodeExtractor import extract_topix_codes
+import torch
+from torch.utils.data import Dataset, DataLoader
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-FEAT_ROOT = PROJECT_ROOT / "features"
-PREP_ROOT = PROJECT_ROOT / "data" / "preprocessing"
-OUT_ROOT = PROJECT_ROOT / "datasets" / "intraday_1h_ae"
-
-MARKET_TICKER = "1306.T"
-
-BASE_RET = 0.03  # 3% target return
-
-N_BARS = 56 # 7 BARS_PER_DAY × 8 days
-BARS_PER_DAY = 7
-STRIDE_DAYS = 1
-
-# walk-forward fold parameters
-TRAIN_DAYS = 252
-VAL_DAYS = 63
-TEST_DAYS = 63
-STEP_DAYS = TEST_DAYS  # 次のfoldへ進む幅
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
 
 
-def _read_features(ticker: str) -> pd.DataFrame:
-    fp = FEAT_ROOT / ticker / "features_1h_for_ae.parquet"
-    if not fp.exists():
-        raise FileNotFoundError(f"Missing features: {fp}")
-    df = pd.read_parquet(fp)
-    if "Datetime" in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+# ----------------------------
+# Settings
+# ----------------------------
+
+@dataclass
+class DatasetSettings:
+    universe_parquet: Optional[Path] = Path(PROJECT_ROOT / "features/universe/features_1h_for_model1_universe.parquet")
+
+    # 必須列
+    id_col: str = "ticker"
+    time_col: str = "Datetime"   # parquetによっては index のことが多い。後で吸収
+    y_cols: Tuple[str, str] = ("y_ret", "y_risk")
+
+    # 例: y_ret/y_risk を作っていない推論用特徴の場合は False にする
+    require_labels: bool = True
+
+    # データ品質（任意）
+    drop_inf: bool = True
+
+
+# ----------------------------
+# IO: load feature tables
+# ----------------------------
+
+def _read_parquet_with_datetime_index(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    # indexにDatetimeが入ってる想定を吸収
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index.name = "Datetime"
+        return df
+    # Datetime列がある場合
+    if "Datetime" in df.columns:
         df = df.set_index("Datetime")
-    df = df.sort_index()
+        return df
+    raise ValueError(f"Datetime index/column not found in: {path}")
+
+
+def load_universe_table(s: DatasetSettings) -> pd.DataFrame:
+    if s.universe_parquet is not None and s.universe_parquet.exists():
+        df = _read_parquet_with_datetime_index(s.universe_parquet)
+        return df
+    # fallback: scan per ticker
+    return load_from_feature_dirs(s)
+
+
+def load_from_feature_dirs(s: DatasetSettings) -> pd.DataFrame:
+    root = s.features_root
+    if not root.exists():
+        raise FileNotFoundError(f"features_root not found: {root}")
+
+    tables: List[pd.DataFrame] = []
+    # ../../features/xxxx.T/features_1h_for_model1.parquet を想定
+    for d in sorted(root.glob("*.T")):
+        p = d / "features_1h_for_model1.parquet"
+        if not p.exists():
+            continue
+        df = _read_parquet_with_datetime_index(p)
+        tables.append(df)
+
+    if not tables:
+        raise FileNotFoundError(f"No feature parquet found under: {root}/xxxx.T/")
+
+    out = pd.concat(tables, axis=0, ignore_index=False).sort_index()
+    return out
+
+
+# ----------------------------
+# feature cols inference & cleaning
+# ----------------------------
+
+def infer_feature_cols(df: pd.DataFrame, id_col: str, y_cols: Sequence[str]) -> List[str]:
+    drop = set([id_col, *y_cols])
+    # 数値列だけ
+    cols = []
+    for c in df.columns:
+        if c in drop:
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            cols.append(c)
+    if not cols:
+        raise ValueError("No numeric feature columns inferred.")
+    return cols
+
+
+def clean_table(
+    df: pd.DataFrame,
+    s: DatasetSettings,
+    feature_cols: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    df = df.copy()
+
+    if s.drop_inf:
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # id列必須
+    if s.id_col not in df.columns:
+        raise ValueError(f"'{s.id_col}' column not found. columns={list(df.columns)[:20]}...")
+
+    # ラベルが必要なら存在チェック
+    if s.require_labels:
+        for y in s.y_cols:
+            if y not in df.columns:
+                raise ValueError(f"label column '{y}' not found. If inference-only, set require_labels=False")
+
+    # feature_cols固定
+    if feature_cols is None:
+        feature_cols = infer_feature_cols(df, s.id_col, s.y_cols if s.require_labels else [])
+    else:
+        missing = [c for c in feature_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"feature_cols missing in df: {missing[:10]}...")
+
+    required = feature_cols + ([*s.y_cols] if s.require_labels else [])
+    df = df.dropna(subset=required)
+
+    # 時系列順に
     if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError(f"{ticker}: features index is not DatetimeIndex")
-    return df
-
-
-def _read_ohlcv(ticker: str) -> pd.DataFrame:
-    fp = PREP_ROOT / ticker / "intraday_1h_preprocessed.parquet"
-    if not fp.exists():
-        raise FileNotFoundError(f"Missing OHLCV: {fp}")
-    df = pd.read_parquet(fp)
-    if "Datetime" in df.columns and not isinstance(df.index, pd.DatetimeIndex):
-        df = df.set_index("Datetime")
+        raise ValueError("df index must be DatetimeIndex")
     df = df.sort_index()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError(f"{ticker}: ohlcv index is not DatetimeIndex")
-    return df
+
+    return df, feature_cols
 
 
-def _daily_last_timestamps(index: pd.DatetimeIndex) -> pd.Series:
-    """Return Series: date -> last timestamp in that date."""
-    s = pd.Series(index, index=index)
-    dates = pd.Series(index.date, index=index)
-    # last timestamp per date
-    last_ts = s.groupby(dates).max()
-    last_ts.index = pd.Index(last_ts.index, name="date")
-    last_ts.name = "end_ts"
-    return last_ts
+# ----------------------------
+# Walk-forward split
+# ----------------------------
 
+@dataclass
+class WalkForwardConfig:
+    # 例: train 240営業日, val 20営業日, test 20営業日
+    train_days: int = 240
+    val_days: int = 20
+    test_days: int = 20
+    step_days: int = 20  # 次のfoldへ進む幅（通常 test_days と同じでOK）
+    min_unique_days: int = 320  # 最低日数
 
-def _build_samples_for_ticker(ticker: str) -> pd.DataFrame:
-    feat = _read_features(ticker)
-    ohlcv = _read_ohlcv(ticker)
+def unique_trading_days(df: pd.DataFrame) -> np.ndarray:
+    # DatetimeIndex → 日付でユニーク
+    days = pd.Index(df.index.date).unique()
+    return np.array(days)
 
-    # Make sure we can compute label based on Close at daily last bar
-    last_feat = _daily_last_timestamps(feat.index)
-    last_px = _daily_last_timestamps(ohlcv.index)
+def make_walk_forward_folds(df: pd.DataFrame, cfg: WalkForwardConfig) -> List[Dict[str, np.ndarray]]:
+    days = unique_trading_days(df)
+    if len(days) < cfg.min_unique_days:
+        raise ValueError(f"Not enough unique days: {len(days)} < {cfg.min_unique_days}")
 
-    # Use intersection of available dates
-    common_dates = last_feat.index.intersection(last_px.index)
-    last_feat = last_feat.loc[common_dates]
-    last_px = last_px.loc[common_dates]
-
-    # Sort by date
-    last_feat = last_feat.sort_index()
-    last_px = last_px.sort_index()
-
-    # Build mapping: end_ts -> integer position in features (for slicing fast)
-    feat_index = feat.index
-    pos_map = pd.Series(np.arange(len(feat_index)), index=feat_index)
-
-    rows = []
-    dates = list(last_feat.index)
-
-    # stride: 1 day
-    for i in range(len(dates) - 1):
-        d = dates[i]
-        d_next = dates[i + 1]
-
-        end_ts = last_feat.loc[d]
-        end_ts_next = last_px.loc[d_next]  # label uses next day close
-
-        # Need end_ts exist in features index (it should)
-        if end_ts not in pos_map.index:
-            continue
-        end_idx = int(pos_map.loc[end_ts])
-
-        start_idx = end_idx - (N_BARS - 1)
-        if start_idx < 0:
-            continue
-
-        # Ensure the window is contiguous in bar count (no missing bars inside)
-        window = feat.iloc[start_idx : end_idx + 1]
-        if len(window) != N_BARS:
-            continue
-
-        # Drop samples containing any NaN (決定済み)
-        if window.isna().any().any():
-            continue
-
-        # 今日の終値（基準価格）
-        end_ts_px = last_px.loc[d]  # 今日の「日次最後足」のtimestamp
-        if end_ts_px not in ohlcv.index:
-            continue
-        close_today = float(ohlcv.loc[end_ts_px, "Close"])
-        if not np.isfinite(close_today) or close_today <= 0:
-            continue
-
-        # 翌日のOHLCV（その日の全時間足）
-        # ※ last_px は「日次最後足」だが、Highを見るために日付で切る
-        next_date = pd.Timestamp(d_next)
-        mask_next_day = (ohlcv.index.date == next_date.date())
-        day_next = ohlcv.loc[mask_next_day]
-        if len(day_next) == 0:
-            continue
-
-        high_next_day = float(day_next["High"].max())
-        target_price = close_today * (1.0 + BASE_RET)
-
-        # ラベル：翌日中に +3% 到達したら 1
-        y = 1 if high_next_day >= target_price else 0
-
-        rows.append(
-            {
-                "ticker": ticker,
-                "date": pd.Timestamp(d),
-                "end_ts": end_ts,
-                "start_idx": start_idx,
-                "end_idx": end_idx,
-                "y": y,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def _make_walk_forward_folds(all_dates: List[pd.Timestamp]) -> List[Dict[str, str]]:
-    """
-    Build folds based on a global date list.
-    Each fold returns date ranges (inclusive start, inclusive end) for train/val/test.
-    """
     folds = []
-    total = len(all_dates)
-    cursor = 0
-
+    start = 0
     while True:
-        train_start = cursor
-        train_end = train_start + TRAIN_DAYS - 1
-        val_end = train_end + VAL_DAYS
-        test_end = val_end + TEST_DAYS
-
-        if test_end >= total:
-            remaining = total - cursor
-            if remaining > 0:
-                print(f"Warning: Insufficient data for complete fold. Remaining days: {remaining}, Required: {TRAIN_DAYS + VAL_DAYS + TEST_DAYS}")
+        train_end = start + cfg.train_days
+        val_end = train_end + cfg.val_days
+        test_end = val_end + cfg.test_days
+        if test_end > len(days):
             break
 
         fold = {
-            "train_start": str(all_dates[train_start].date()),
-            "train_end": str(all_dates[train_end].date()),
-            "val_start": str(all_dates[train_end + 1].date()),
-            "val_end": str(all_dates[val_end].date()),
-            "test_start": str(all_dates[val_end + 1].date()),
-            "test_end": str(all_dates[test_end].date()),
+            "train_days": days[start:train_end],
+            "val_days": days[train_end:val_end],
+            "test_days": days[val_end:test_end],
         }
         folds.append(fold)
-        cursor += STEP_DAYS
 
+        start += cfg.step_days
+
+    if not folds:
+        raise ValueError("No folds generated. Adjust WalkForwardConfig.")
     return folds
 
+def select_by_days(df: pd.DataFrame, days: np.ndarray) -> pd.DataFrame:
+    mask = np.isin(df.index.date, days)
+    return df.loc[mask].copy()
 
-def main():
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    tickers = list(extract_topix_codes())[:100]
+# ----------------------------
+# Scaling (leak-safe)
+# ----------------------------
 
-    # 1306.T を必ず含める（末尾に追加 → 重複排除）
-    if MARKET_TICKER not in tickers:
-        tickers.append(MARKET_TICKER)
+@dataclass
+class FoldScaler:
+    scaler: StandardScaler
+    feature_cols: List[str]
 
-    # 念のため重複排除（順序保持）
-    seen = set()
-    tickers = [t for t in tickers if not (t in seen or seen.add(t))]
+    @staticmethod
+    def fit(train_df: pd.DataFrame, feature_cols: List[str], exclude_cols: Optional[List[str]] = None) -> "FoldScaler":
+        exclude_cols = exclude_cols or []
+        cols = [c for c in feature_cols if c not in exclude_cols]
+        sc = StandardScaler()
+        sc.fit(train_df[cols].to_numpy(dtype=np.float32))
+        return FoldScaler(scaler=sc, feature_cols=cols)
 
-    # Build samples for all tickers
-    all_samples = []
-    errors = []
+    def transform(self, df: pd.DataFrame) -> np.ndarray:
+        X = df[self.feature_cols].to_numpy(dtype=np.float32)
+        return self.scaler.transform(X).astype(np.float32)
 
-    for i, tkr in enumerate(tickers, 1):
-        try:
-            df = _build_samples_for_ticker(tkr)
-            all_samples.append(df)
-            print(f"[{i:03d}/{len(tickers)}] OK {tkr} samples={len(df)}")
-        except Exception as e:
-            errors.append({"ticker": tkr, "error": repr(e)})
-            print(f"[{i:03d}/{len(tickers)}] ERR {tkr} {repr(e)}")
 
-    samples = pd.concat(all_samples, axis=0, ignore_index=True) if all_samples else pd.DataFrame()
-    
-    if samples.empty:
-        print("Error: No samples were created. Check data files and preprocessing steps.")
-        if errors:
-            (OUT_ROOT / "_errors.json").write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"Saved errors: {OUT_ROOT / '_errors.json'} count={len(errors)}")
-        return
-    
-    samples = samples.sort_values(["date", "ticker"]).reset_index(drop=True)
+# ----------------------------
+# PyTorch Dataset
+# ----------------------------
 
-    # Save master samples
-    samples_fp = OUT_ROOT / "samples.parquet"
-    samples.to_parquet(samples_fp)
-    print(f"Saved: {samples_fp} rows={len(samples)}")
+class Model1Dataset(Dataset):
+    def __init__(self, X: np.ndarray, y: Optional[np.ndarray] = None):
+        self.X = torch.from_numpy(X)  # [N, D]
+        self.y = None if y is None else torch.from_numpy(y)  # [N, 2]
 
-    # Build global date axis from market ticker (stable reference)
-    # Use OHLCV daily-last dates for market ticker
-    try:
-        mkt_ohlcv = _read_ohlcv(MARKET_TICKER)
-    except Exception as e:
-        print(f"Error: Failed to load market ticker {MARKET_TICKER}: {repr(e)}")
-        print("Cannot build folds without market reference data.")
-        if errors:
-            (OUT_ROOT / "_errors.json").write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"Saved errors: {OUT_ROOT / '_errors.json'} count={len(errors)}")
-        return
-    
-    mkt_last = _daily_last_timestamps(mkt_ohlcv.index).sort_index()
-    all_dates = [pd.Timestamp(d) for d in mkt_last.index]
+    def __len__(self) -> int:
+        return self.X.shape[0]
 
-    folds = _make_walk_forward_folds(all_dates)
-    folds_fp = OUT_ROOT / "folds.json"
-    folds_fp.write_text(json.dumps({"folds": folds, "params": {
-        "TRAIN_DAYS": TRAIN_DAYS, "VAL_DAYS": VAL_DAYS, "TEST_DAYS": TEST_DAYS,
-        "STEP_DAYS": STEP_DAYS, "N_BARS": N_BARS, "BARS_PER_DAY": BARS_PER_DAY
-    }}, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Saved: {folds_fp} folds={len(folds)}")
+    def __getitem__(self, idx: int):
+        if self.y is None:
+            return self.X[idx]
+        return self.X[idx], self.y[idx]
 
-    # Materialize per-fold sample lists
-    for k, f in enumerate(folds):
-        tr_start = pd.Timestamp(f["train_start"])
-        tr_end = pd.Timestamp(f["train_end"])
-        va_start = pd.Timestamp(f["val_start"])
-        va_end = pd.Timestamp(f["val_end"])
-        te_start = pd.Timestamp(f["test_start"])
-        te_end = pd.Timestamp(f["test_end"])
 
-        train_df = samples[(samples["date"] >= tr_start) & (samples["date"] <= tr_end)]
-        val_df = samples[(samples["date"] >= va_start) & (samples["date"] <= va_end)]
-        test_df = samples[(samples["date"] >= te_start) & (samples["date"] <= te_end)]
+# ----------------------------
+# Public API: build datasets per fold
+# ----------------------------
 
-        train_df.to_parquet(OUT_ROOT / f"fold_{k:03d}_train.parquet")
-        val_df.to_parquet(OUT_ROOT / f"fold_{k:03d}_val.parquet")
-        test_df.to_parquet(OUT_ROOT / f"fold_{k:03d}_test.parquet")
+@dataclass
+class DataLoadersConfig:
+    batch_size: int = 512
+    num_workers: int = 0
+    pin_memory: bool = True
 
-        print(f"[fold {k:03d}] train={len(train_df)} val={len(val_df)} test={len(test_df)}")
+def build_fold_datasets_and_loaders(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    fold: Dict[str, np.ndarray],
+    s: DatasetSettings,
+    dl_cfg: DataLoadersConfig = DataLoadersConfig(),
+) -> Dict[str, object]:
+    # split
+    train_df = select_by_days(df, fold["train_days"])
+    val_df = select_by_days(df, fold["val_days"])
+    test_df = select_by_days(df, fold["test_days"])
 
-    # Save errors if any
-    if errors:
-        (OUT_ROOT / "_errors.json").write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Saved errors: {OUT_ROOT / '_errors.json'} count={len(errors)}")
+    # scaler: train only (leak-safe)
+    # sin/cosは標準化不要なので除外するのが推奨
+    exclude = [c for c in feature_cols if c.endswith("_sin") or c.endswith("_cos")]
+    fs = FoldScaler.fit(train_df, feature_cols, exclude_cols=exclude)
+
+    X_train = fs.transform(train_df)
+    X_val = fs.transform(val_df)
+    X_test = fs.transform(test_df)
+
+    if s.require_labels:
+        y_train = train_df[list(s.y_cols)].to_numpy(dtype=np.float32)
+        y_val = val_df[list(s.y_cols)].to_numpy(dtype=np.float32)
+        y_test = test_df[list(s.y_cols)].to_numpy(dtype=np.float32)
+    else:
+        y_train = y_val = y_test = None
+
+    ds_train = Model1Dataset(X_train, y_train)
+    ds_val = Model1Dataset(X_val, y_val)
+    ds_test = Model1Dataset(X_test, y_test)
+
+    # shuffleは train だけ（時系列リークは起きない。日付でsplit済みのため）
+    dl_train = DataLoader(ds_train, batch_size=dl_cfg.batch_size, shuffle=True,
+                          num_workers=dl_cfg.num_workers, pin_memory=dl_cfg.pin_memory, drop_last=False)
+    dl_val = DataLoader(ds_val, batch_size=dl_cfg.batch_size, shuffle=False,
+                        num_workers=dl_cfg.num_workers, pin_memory=dl_cfg.pin_memory, drop_last=False)
+    dl_test = DataLoader(ds_test, batch_size=dl_cfg.batch_size, shuffle=False,
+                         num_workers=dl_cfg.num_workers, pin_memory=dl_cfg.pin_memory, drop_last=False)
+
+    return {
+        "train_df": train_df,
+        "val_df": val_df,
+        "test_df": test_df,
+        "feature_cols_scaled": fs.feature_cols,  # 実際にスケールした列
+        "scaler": fs.scaler,
+        "dl_train": dl_train,
+        "dl_val": dl_val,
+        "dl_test": dl_test,
+    }
+
+
+# ----------------------------
+# main-like entry (no CLI)
+# ----------------------------
+
+def main_build_datasets() -> None:
+    s = DatasetSettings(
+        universe_parquet=Path(PROJECT_ROOT / "features/universe/features_1h_for_model1_universe.parquet"),
+        require_labels=True,  # 学習ならTrue
+    )
+
+    df = load_universe_table(s)
+
+    # feature cols固定（この順序を保存しておくのが重要）
+    df, feature_cols = clean_table(df, s, feature_cols=None)
+
+    wf = WalkForwardConfig(
+        train_days=240,
+        val_days=20,
+        test_days=20,
+        step_days=20,
+        min_unique_days=320,
+    )
+    folds = make_walk_forward_folds(df, wf)
+    print(f"folds={len(folds)}, total_rows={len(df)}, unique_days={len(unique_trading_days(df))}")
+    print(f"n_features={len(feature_cols)}")
+
+    # 例: 0番foldを作ってみる
+    dl_cfg = DataLoadersConfig(batch_size=512, num_workers=0)
+    pack = build_fold_datasets_and_loaders(df, feature_cols, folds[0], s, dl_cfg)
+
+    print("train/val/test rows:",
+          len(pack["train_df"]), len(pack["val_df"]), len(pack["test_df"]))
+    print("scaled feature cols:", len(pack["feature_cols_scaled"]))
 
 
 if __name__ == "__main__":
-    main()
+    main_build_datasets()

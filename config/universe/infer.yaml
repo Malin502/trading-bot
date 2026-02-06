@@ -1,5 +1,0 @@
-universe:
-  source: "train"
-  filters:
-    volume_min: 1000000
-    tradable_only: true
