@@ -195,19 +195,44 @@ def select_by_days(df: pd.DataFrame, days: np.ndarray) -> pd.DataFrame:
 @dataclass
 class FoldScaler:
     scaler: StandardScaler
-    feature_cols: List[str]
+    scale_cols: List[str]          # 標準化する列
+    passthrough_cols: List[str]    # そのまま通す列
+    feature_cols: List[str]        # 最終的なXの列順（契約）
 
     @staticmethod
-    def fit(train_df: pd.DataFrame, feature_cols: List[str], exclude_cols: Optional[List[str]] = None) -> "FoldScaler":
+    def fit(
+        train_df: pd.DataFrame,
+        feature_cols: List[str],
+        exclude_cols: Optional[List[str]] = None
+    ) -> "FoldScaler":
         exclude_cols = exclude_cols or []
-        cols = [c for c in feature_cols if c not in exclude_cols]
+        scale_cols = [c for c in feature_cols if c not in exclude_cols]
+        passthrough_cols = [c for c in feature_cols if c in exclude_cols]
+
         sc = StandardScaler()
-        sc.fit(train_df[cols].to_numpy(dtype=np.float32))
-        return FoldScaler(scaler=sc, feature_cols=cols)
+        sc.fit(train_df[scale_cols].to_numpy(dtype=np.float32))
+        return FoldScaler(
+            scaler=sc,
+            scale_cols=scale_cols,
+            passthrough_cols=passthrough_cols,
+            feature_cols=feature_cols,   # ここが列順契約
+        )
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
-        X = df[self.feature_cols].to_numpy(dtype=np.float32)
-        return self.scaler.transform(X).astype(np.float32)
+        Xs = self.scaler.transform(df[self.scale_cols].to_numpy(dtype=np.float32)).astype(np.float32)
+        if self.passthrough_cols:
+            Xp = df[self.passthrough_cols].to_numpy(dtype=np.float32)
+            # scale_cols + passthrough_cols の順で一旦結合
+            X_tmp = np.concatenate([Xs, Xp], axis=1)
+            tmp_cols = self.scale_cols + self.passthrough_cols
+        else:
+            X_tmp = Xs
+            tmp_cols = self.scale_cols
+
+        # feature_cols の順に並び替え（これが“契約”）
+        col_to_i = {c: i for i, c in enumerate(tmp_cols)}
+        idx = [col_to_i[c] for c in self.feature_cols]
+        return X_tmp[:, idx].astype(np.float32)
 
 
 # ----------------------------
@@ -282,7 +307,9 @@ def build_fold_datasets_and_loaders(
         "train_df": train_df,
         "val_df": val_df,
         "test_df": test_df,
-        "feature_cols_scaled": fs.feature_cols,  # 実際にスケールした列
+        "feature_cols": fs.feature_cols,
+        "scale_cols": fs.scale_cols,
+        "passthrough_cols": fs.passthrough_cols,
         "scaler": fs.scaler,
         "dl_train": dl_train,
         "dl_val": dl_val,
@@ -307,7 +334,7 @@ def main_build_datasets() -> None:
 
     wf = WalkForwardConfig(
         train_days=240,
-        val_days=20,
+        val_days=60,
         test_days=20,
         step_days=20,
         min_unique_days=320,

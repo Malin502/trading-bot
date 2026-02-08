@@ -166,7 +166,10 @@ def main():
     codes = extract_topix_codes()  # returns list with ".T"
     codes = list(codes)[:100]      # ensure 100 tickers
     
-    codes = ['1306.T']  # For testing, process only TOPIX ETF
+    # 市場コード（1306.T）も追加
+    market_ticker = "1306.T"
+    if market_ticker not in codes:
+        codes = [market_ticker] + codes
 
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 

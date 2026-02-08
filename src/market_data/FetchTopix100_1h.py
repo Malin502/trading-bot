@@ -206,9 +206,21 @@ def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean
 if __name__ == "__main__":
     # テスト用コード抽出・取得実行
     import sys
-    from market_data.CodeExtractor import extract_topix_codes
+    from pathlib import Path
+    
+    # プロジェクトルートをsys.pathに追加
+    project_root = Path(__file__).resolve().parent.parent.parent
+    sys.path.insert(0, str(project_root))
+    
+    from src.market_data.CodeExtractor import extract_topix_codes
 
     topix100 = extract_topix_codes()
-    print(f"取得したコード数: {len(topix100)}")
+    
+    # 市場コード（1306.T）も追加
+    market_ticker = "1306.T"
+    if market_ticker not in topix100:
+        topix100 = [market_ticker] + list(topix100)
+    
+    print(f"取得したコード数: {len(topix100)} (市場コード含む)")
 
     fetch_and_save_730d(topix100, out_clean_dir="data/clean")

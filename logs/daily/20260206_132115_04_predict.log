@@ -1,0 +1,20 @@
+CMD: python trade/predict_model1_latest.py
+CWD: /workspaces/trading-bot
+PYTHONPATH: /workspaces/trading-bot
+================================================================================
+
+Using fold: artifacts/model1/fold_021
+trade/predict_model1_latest.py:92: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state_dict = torch.load(model_path, map_location="cpu")
+Saved: artifacts/model1/inference/rank_2026-02-05.csv
+                 datetime ticker  pred_ret  pred_risk  pred_risk_abs    score
+2026-02-05 15:00:00+09:00 9432.T  0.001251  -0.000308       0.000308 4.054159
+2026-02-05 15:00:00+09:00 9434.T  0.004528  -0.002759       0.002759 1.640411
+2026-02-05 15:00:00+09:00 1928.T  0.003119  -0.003796       0.003796 0.821397
+2026-02-05 15:00:00+09:00 8113.T  0.003588  -0.004459       0.004459 0.804584
+2026-02-05 15:00:00+09:00 2914.T  0.002731  -0.003905       0.003905 0.699201
+2026-02-05 15:00:00+09:00 2802.T  0.003542  -0.005130       0.005130 0.690236
+2026-02-05 15:00:00+09:00 3382.T  0.003218  -0.005585       0.005585 0.576136
+2026-02-05 15:00:00+09:00 5020.T  0.005473  -0.009544       0.009544 0.573409
+2026-02-05 15:00:00+09:00 9433.T  0.003390  -0.006304       0.006304 0.537705
+2026-02-05 15:00:00+09:00 4543.T  0.004050  -0.007828       0.007828 0.517337

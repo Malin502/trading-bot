@@ -1,7 +1,9 @@
 import pandas as pd
+import pathlib
 
 # ファイルを読み込む
-df = pd.read_parquet('data/preprocessing/1306.T/intraday_1h_preprocessed.parquet')
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+df = pd.read_parquet(PROJECT_ROOT / 'features/1925.T/features_1h_for_model1.parquet')
 
 # 先頭を表示
 print(df.tail())
