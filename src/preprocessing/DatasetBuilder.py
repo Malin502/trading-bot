@@ -150,6 +150,7 @@ class WalkForwardConfig:
     test_days: int = 20
     step_days: int = 20  # 次のfoldへ進む幅（通常 test_days と同じでOK）
     min_unique_days: int = 320  # 最低日数
+    purge_days: int = 1  # train/val/test の境界に入れるバッファ日数
 
 def unique_trading_days(df: pd.DataFrame) -> np.ndarray:
     # DatetimeIndex → 日付でユニーク
@@ -165,15 +166,17 @@ def make_walk_forward_folds(df: pd.DataFrame, cfg: WalkForwardConfig) -> List[Di
     start = 0
     while True:
         train_end = start + cfg.train_days
-        val_end = train_end + cfg.val_days
-        test_end = val_end + cfg.test_days
+        val_start = train_end + cfg.purge_days
+        val_end = val_start + cfg.val_days
+        test_start = val_end + cfg.purge_days
+        test_end = test_start + cfg.test_days
         if test_end > len(days):
             break
 
         fold = {
             "train_days": days[start:train_end],
-            "val_days": days[train_end:val_end],
-            "test_days": days[val_end:test_end],
+            "val_days": days[val_start:val_end],
+            "test_days": days[test_start:test_end],
         }
         folds.append(fold)
 
@@ -262,6 +265,44 @@ class DataLoadersConfig:
     batch_size: int = 512
     num_workers: int = 0
     pin_memory: bool = True
+    # 0以下なら無効。>0なら trainデータで y_ret との相関上位を採用
+    feature_top_n: int = 0
+
+
+def _select_top_features_by_corr(
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+    y_col: str,
+    top_n: int,
+) -> List[str]:
+    if top_n <= 0 or top_n >= len(feature_cols):
+        return feature_cols
+    if y_col not in train_df.columns:
+        return feature_cols
+
+    y = train_df[y_col].to_numpy(dtype=np.float64)
+    scores: List[Tuple[float, str]] = []
+    for c in feature_cols:
+        x = train_df[c].to_numpy(dtype=np.float64)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if int(mask.sum()) < 32:
+            scores.append((0.0, c))
+            continue
+        xv = x[mask]
+        yv = y[mask]
+        sx = float(np.std(xv))
+        sy = float(np.std(yv))
+        if sx < 1e-12 or sy < 1e-12:
+            scores.append((0.0, c))
+            continue
+        corr = float(np.corrcoef(xv, yv)[0, 1])
+        if not np.isfinite(corr):
+            corr = 0.0
+        scores.append((abs(corr), c))
+
+    scores.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    selected = [c for _, c in scores[:top_n]]
+    return selected
 
 def build_fold_datasets_and_loaders(
     df: pd.DataFrame,
@@ -275,10 +316,19 @@ def build_fold_datasets_and_loaders(
     val_df = select_by_days(df, fold["val_days"])
     test_df = select_by_days(df, fold["test_days"])
 
+    selected_feature_cols = feature_cols
+    if s.require_labels and dl_cfg.feature_top_n > 0:
+        selected_feature_cols = _select_top_features_by_corr(
+            train_df=train_df,
+            feature_cols=feature_cols,
+            y_col=s.y_cols[0],
+            top_n=dl_cfg.feature_top_n,
+        )
+
     # scaler: train only (leak-safe)
     # sin/cosは標準化不要なので除外するのが推奨
-    exclude = [c for c in feature_cols if c.endswith("_sin") or c.endswith("_cos")]
-    fs = FoldScaler.fit(train_df, feature_cols, exclude_cols=exclude)
+    exclude = [c for c in selected_feature_cols if c.endswith("_sin") or c.endswith("_cos")]
+    fs = FoldScaler.fit(train_df, selected_feature_cols, exclude_cols=exclude)
 
     X_train = fs.transform(train_df)
     X_val = fs.transform(val_df)
@@ -349,7 +399,7 @@ def main_build_datasets() -> None:
 
     print("train/val/test rows:",
           len(pack["train_df"]), len(pack["val_df"]), len(pack["test_df"]))
-    print("scaled feature cols:", len(pack["feature_cols_scaled"]))
+    print("selected feature cols:", len(pack["feature_cols"]))
 
 
 if __name__ == "__main__":

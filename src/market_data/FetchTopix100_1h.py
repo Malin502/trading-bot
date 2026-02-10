@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -124,6 +125,7 @@ class FetchConfig:
     chunk_period: str = "730d"   # yfinanceの上限に合わせる
     sleep_sec: float = 1.0
     max_retries: int = 3
+    max_workers: int = 10  # 並列スレッド数（APIレート制限を考慮）
 
 
 def fetch(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
@@ -155,9 +157,43 @@ def fetch(symbol: str, cfg: FetchConfig, end_dt: Optional[pd.Timestamp]) -> pd.D
     raise RuntimeError(f"fetch failed: {symbol} end={end_str}") from last_err
 
 
+def _fetch_single_symbol(sym: str, cfg: FetchConfig, now_jst: pd.Timestamp, out_clean: Path) -> tuple[str, bool, str]:
+    """
+    単一銘柄のデータ取得と保存（スレッド内で実行）
+    Returns: (symbol, success, message)
+    """
+    try:
+        all_parts = []
+
+        raw = fetch(sym, cfg, end_dt=now_jst)
+
+        part = normalize_intraday_1h(raw)
+        part = slice_to_1500_jst(part)  # 15:15などを全期間で排除
+
+        if not part.empty:
+            all_parts.append(part)
+
+        time.sleep(cfg.sleep_sec)
+
+        if all_parts:
+            df = pd.concat(all_parts, axis=0)
+            df = df[~df.index.duplicated(keep="last")].sort_index()
+        else:
+            df = pd.DataFrame()
+
+        upsert_parquet_monthly(out_clean, sym, df)
+
+        last_ts = df.index.max() if not df.empty else None
+        msg = f"rows={len(df)} last={last_ts}"
+        return (sym, True, msg)
+
+    except Exception as e:
+        return (sym, False, str(e))
+
+
 def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean") -> None:
     """
-    symbols（.T付き）を対象に、730dまでのデータを取得して保存する
+    symbols（.T付き）を対象に、730dまでのデータを取得して保存する（並列処理版）
     """
     cfg = FetchConfig()
     out_clean = Path(out_clean_dir)
@@ -168,35 +204,30 @@ def fetch_and_save_730d(symbols: Iterable[str], out_clean_dir: str = "data/clean
 
     symbols = [s.strip() for s in symbols if s and s.strip()]
 
-    for sym in symbols:
-        try:
-            all_parts = []
+    print(f"取得開始: {len(symbols)}銘柄を{cfg.max_workers}スレッドで並列処理")
+    
+    success_count = 0
+    failure_count = 0
 
-            raw = fetch(sym, cfg, end_dt=now_jst)
+    # ThreadPoolExecutorで並列処理
+    with ThreadPoolExecutor(max_workers=cfg.max_workers) as executor:
+        # 全銘柄のタスクを投入
+        future_to_symbol = {
+            executor.submit(_fetch_single_symbol, sym, cfg, now_jst, out_clean): sym 
+            for sym in symbols
+        }
 
-            part = normalize_intraday_1h(raw)
-            part = slice_to_1500_jst(part)  # 15:15などを全期間で排除
-
-            if not part.empty:
-                all_parts.append(part)
-
-            time.sleep(cfg.sleep_sec)
-
-            if all_parts:
-                df = pd.concat(all_parts, axis=0)
-                df = df[~df.index.duplicated(keep="last")].sort_index()
+        # 完了したタスクから順次結果を取得
+        for future in as_completed(future_to_symbol):
+            sym, success, msg = future.result()
+            if success:
+                print(f"[OK] {sym}: {msg}")
+                success_count += 1
             else:
-                df = pd.DataFrame()
+                print(f"[NG] {sym}: {msg}")
+                failure_count += 1
 
-            upsert_parquet_monthly(out_clean, sym, df)
-
-            last_ts = df.index.max() if not df.empty else None
-            print(f"[OK] {sym}: rows={len(df)} last={last_ts}")
-
-        except Exception as e:
-            print(f"[NG] {sym}: {e}")
-
-        time.sleep(cfg.sleep_sec)
+    print(f"\n完了: 成功={success_count} 失敗={failure_count}")
 
 
 # -------- 使い方 --------

@@ -3,28 +3,31 @@ data:
   # feature_cols: null  # nullなら自動推論（numeric列から required列を除外）
 
 walkforward:
-  train_days: 240
-  val_days: 60
-  test_days: 20
-  step_days: 20
+  train_days: 180
+  val_days: 90
+  test_days: 60
+  step_days: 60
 
 train:
   batch_size: 8192
   num_workers: 0
+  feature_top_n: 100
 
-  width: 256
-  depth: 4
-  dropout: 0.10
+  width: 128
+  depth: 2
+  dropout: 0.25
 
   lr: 0.001
   weight_decay: 0.0001
   max_epochs: 50
   patience: 8
-  lambda_risk: 1.0
+  task_mode: "single"
+  lambda_risk: 0.0
+  earlystop_score_method: "ret_only"
   huber_delta: 1.0
   ret_abs_weight_alpha: 2.0
   ret_abs_weight_cap: 5.0
-  rank_loss_weight: 0.2
+  rank_loss_weight: 0.7
   rank_num_pairs: 2048
   rank_temperature: 1.0
   grad_clip: 1.0

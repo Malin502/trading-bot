@@ -14,7 +14,7 @@ import pandas as pd
 # ---------------------------
 
 # 入力予測ファイル（preds_test.parquet など）
-INPUT_PATH = Path("artifacts/model1/fold_021/preds_test.parquet")
+INPUT_PATH = Path("artifacts/model1/fold_006/preds_test.parquet")
 
 # 日次PnLの保存先（不要なら None）
 SAVE_DAILY_PATH: Optional[Path] = None
@@ -24,10 +24,10 @@ class BacktestConfig:
     topk: int = 5  # 日次で選抜する銘柄数
     eps: float = 1e-6  # 分母ゼロ回避のための微小値
     score_clip: Optional[float] = None  # スコアの上下クリップ（Noneなら無効）
-    score_method: str = "simple"  # スコア方式: simple | cost_aware | sharpe_adj | utility
+    score_method: str = "sharpe_adj"  # スコア方式: ret_only | simple | cost_aware | sharpe_adj | utility
     risk_aversion: float = 1.0  # utilityのリスク回避係数（無次元、大きいほど保守的）
-    cost_bps: float = 5.0  # 取引コスト（bps、往復。10bps=0.10%）
-    slippage_bps: float = 3.0  # スリッページ（bps、往復。10bps=0.10%）
+    cost_bps: float = 0.0  # 取引コスト（bps、往復。10bps=0.10%）
+    slippage_bps: float = 5.0  # スリッページ（bps、往復。10bps=0.10%）
     turnover_penalty_bps: float = 8.0  # 前日ポジ差分ベースの選抜時ペナルティ（bps, 片道）
     sector_neutralize: bool = False  # セクター中立化（セクター内でスコアをランク正規化）
     sector_map_path: Optional[Path] = None  # セクターマッピングJSONのパス
@@ -38,8 +38,8 @@ CFG = BacktestConfig(
     topk=5,  # 日次で選ぶ銘柄数
     score_method="utility",  # スコア方式（利益重視ならutility推奨）
     risk_aversion=1.0,  # リスク回避（無次元、utilityのみ有効）
-    cost_bps=5.0,  # 取引コスト（bps、往復。10bps=0.10%）
-    slippage_bps=3.0,  # スリッページ（bps、往復。10bps=0.10%）
+    cost_bps=0.0,  # 取引コスト（bps、往復。10bps=0.10%）
+    slippage_bps=5.0,  # スリッページ（bps、往復。10bps=0.10%）
     score_clip=None,  # スコアの上下クリップ
 )
 
@@ -55,8 +55,6 @@ def add_score(
     score_clip: Optional[float] = None,
     method: str = "simple",
     risk_aversion: float = 1.0,
-    cost_bps: float = 5.0,
-    slippage_bps: float = 3.0,
     sector_neutralize: bool = False,
     sector_map: Optional[Dict[str, str]] = None,
     ticker_col: str = "ticker",
@@ -64,7 +62,9 @@ def add_score(
     out = df.copy()
     out["pred_risk_pos"] = out["pred_risk"].clip(lower=0.0)
 
-    if method == "utility":
+    if method == "ret_only":
+        score = out["pred_ret"]
+    elif method == "utility":
         score = out["pred_ret"] - risk_aversion * (out["pred_risk_pos"] ** 2)
     elif method == "sharpe_adj":
         score = out["pred_ret"] / (out["pred_risk_pos"] + eps) - 0.5 * out["pred_risk_pos"]
@@ -185,8 +185,6 @@ def run_topk_daily_backtest(
         score_clip=cfg.score_clip,
         method=cfg.score_method,
         risk_aversion=cfg.risk_aversion,
-        cost_bps=cfg.cost_bps,
-        slippage_bps=cfg.slippage_bps,
         sector_neutralize=cfg.sector_neutralize,
         sector_map=sector_map,
         ticker_col=ticker_col,

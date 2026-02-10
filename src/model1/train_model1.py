@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import sys
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -14,7 +15,11 @@ from src.preprocessing.DatasetBuilder import (
     build_fold_datasets_and_loaders,
 )
 
-from _train import TrainCfg, train_model1_one_fold
+try:
+    from _train import TrainCfg, train_model1_one_fold
+except ImportError:
+    # package import (e.g. `python -m src.model1.train_model1`)
+    from src.model1._train import TrainCfg, train_model1_one_fold
 
 
 def fold_provider_existing(
@@ -29,6 +34,11 @@ def fold_provider_existing(
 
     for fold_id, fold in enumerate(folds):
         pack = build_fold_datasets_and_loaders(df, feature_cols, fold, s, dl_cfg)
+        if len(pack["feature_cols"]) != len(feature_cols):
+            print(
+                f"[Fold {fold_id:03d}] feature selection: "
+                f"{len(feature_cols)} -> {len(pack['feature_cols'])}"
+            )
 
         train_df = pack["train_df"]
         val_df = pack["val_df"]
@@ -63,24 +73,31 @@ def main():
     )
 
     wf = WalkForwardConfig(
-        train_days=240,
-        val_days=60,
-        test_days=20,
-        step_days=20,
-        min_unique_days=320,
+        train_days=180,
+        val_days=90,
+        test_days=60,
+        step_days=60,
+        min_unique_days=330,
     )
 
-    dl_cfg = DataLoadersConfig(batch_size=512, num_workers=0, pin_memory=True)
+    dl_cfg = DataLoadersConfig(
+        batch_size=512,
+        num_workers=0,
+        pin_memory=True,
+        feature_top_n=0,
+    )
 
     train_cfg = TrainCfg(
-        width=256,
-        depth=4,
-        dropout=0.10,
+        width=128,
+        depth=2,
+        dropout=0.25,
         lr=1e-3,
         weight_decay=1e-4,
         max_epochs=100,
         patience=12,
-        lambda_risk=1.0,
+        task_mode="single",
+        lambda_risk=0.0,
+        earlystop_score_method="ret_only",
         huber_delta=1.0,
         grad_clip=1.0,
     )
@@ -128,9 +145,9 @@ def main():
     
     # 全体の平均メトリクスを表示
     avg_val_ret = sum(m['val']['mae_ret'] for m in all_metrics) / len(all_metrics)
-    avg_val_risk = sum(m['val']['mae_risk'] for m in all_metrics) / len(all_metrics)
+    avg_val_risk = float(np.nanmean([m['val']['mae_risk'] for m in all_metrics]))
     avg_test_ret = sum(m['test']['mae_ret'] for m in all_metrics) / len(all_metrics)
-    avg_test_risk = sum(m['test']['mae_risk'] for m in all_metrics) / len(all_metrics)
+    avg_test_risk = float(np.nanmean([m['test']['mae_risk'] for m in all_metrics]))
     
     print(f"\nAverage Metrics across all folds:")
     print(f"  Val  - MAE Ret: {avg_val_ret:.6f}, MAE Risk: {avg_val_risk:.6f}")

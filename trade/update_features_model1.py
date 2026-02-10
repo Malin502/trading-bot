@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.preprocessing.FeatureBuilder1h import (
     FeatureConfig,
     add_sector_features,
+    add_cross_sectional_normalization,
     build_features_for_ticker,
     build_sector_proxy_data,
     load_preprocessed_parquet,
@@ -223,6 +224,18 @@ def main() -> None:
         except Exception as e:
             if VERBOSE:
                 print(f"[WARN] sector features skipped: {e}")
+
+    # Cross-sectional normalization (rank/zscore)
+    result_reset = result_df.reset_index()
+    dt_name = result_reset.columns[0]
+    result_reset = add_cross_sectional_normalization(
+        result_reset,
+        dt_col=dt_name,
+        exclude_cols=[dt_name, "ticker"],
+        add_rank=True,
+        add_zscore=True,
+    )
+    result_df = result_reset.set_index(dt_name)
 
     result_reset = result_df.reset_index()
     dt_name = result_reset.columns[0]

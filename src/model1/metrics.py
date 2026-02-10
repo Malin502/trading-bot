@@ -13,3 +13,13 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
     if a.std() == 0 or b.std() == 0:
         return 0.0
     return float(np.corrcoef(a, b)[0, 1])
+
+def rank_ic(pred: np.ndarray, target: np.ndarray) -> float:
+    """Rank Information Coefficient (Spearman correlation)"""
+    from scipy.stats import spearmanr
+    if len(pred) < 2:
+        return 0.0
+    rho, _ = spearmanr(pred, target, nan_policy='omit')
+    if np.isnan(rho):
+        return 0.0
+    return float(rho)

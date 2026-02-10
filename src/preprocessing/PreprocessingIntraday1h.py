@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
@@ -162,7 +163,28 @@ def preprocess_one(ticker: str) -> dict:
     return meta
 
 
-def main():
+def _process_single_ticker(tkr: str, idx: int, total: int) -> tuple[bool, str, dict | None]:
+    """
+    単一銘柄の前処理（スレッド内で実行）
+    Returns: (success, ticker, result_or_error_dict)
+    """
+    try:
+        meta = preprocess_one(tkr)
+        print(f"[{idx:03d}/{total}] OK  {tkr}  days={meta['kept_full_days']}  times={meta['valid_times_hhmm']}")
+        return (True, tkr, meta)
+    except Exception as e:
+        error_dict = {"ticker": tkr, "error": repr(e)}
+        print(f"[{idx:03d}/{total}] ERR {tkr}  {repr(e)}")
+        return (False, tkr, error_dict)
+
+
+def main(max_workers: int = 5):
+    """
+    並列処理でTOPIX100銘柄の前処理を実行
+    
+    Args:
+        max_workers: 並列スレッド数（デフォルト5）
+    """
     codes = extract_topix_codes()  # returns list with ".T"
     codes = list(codes)[:100]      # ensure 100 tickers
     
@@ -173,17 +195,27 @@ def main():
 
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    print(f"前処理開始: {len(codes)}銘柄を{max_workers}スレッドで並列処理")
+    
     results = []
     errors = []
+    total = len(codes)
 
-    for i, tkr in enumerate(codes, 1):
-        try:
-            meta = preprocess_one(tkr)
-            results.append(meta)
-            print(f"[{i:03d}/{len(codes)}] OK  {tkr}  days={meta['kept_full_days']}  times={meta['valid_times_hhmm']}")
-        except Exception as e:
-            errors.append({"ticker": tkr, "error": repr(e)})
-            print(f"[{i:03d}/{len(codes)}] ERR {tkr}  {repr(e)}")
+    # ThreadPoolExecutorで並列処理
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 全銘柄のタスクを投入（indexも渡す）
+        future_to_ticker = {
+            executor.submit(_process_single_ticker, tkr, i + 1, total): tkr 
+            for i, tkr in enumerate(codes)
+        }
+
+        # 完了したタスクから順次結果を取得
+        for future in as_completed(future_to_ticker):
+            success, tkr, data = future.result()
+            if success:
+                results.append(data)
+            else:
+                errors.append(data)
 
     # Save run summary
     summary = {
@@ -192,7 +224,7 @@ def main():
         "errors": errors,
     }
     (OUT_ROOT / "_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nDone. processed={len(results)} failed={len(errors)}")
+    print(f"\n完了. processed={len(results)} failed={len(errors)}")
     print(f"Summary: {OUT_ROOT / '_summary.json'}")
 
 

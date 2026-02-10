@@ -15,6 +15,7 @@ def make_walkforward_folds(
     val_days: int = 20,
     test_days: int = 20,
     step_days: int = 20,
+    purge_days: int = 1,
 ) -> list[FoldIndex]:
     """
     df: 1行=1銘柄×1時点(15:00) を含む想定。datetimeで日付単位に折る。
@@ -31,8 +32,16 @@ def make_walkforward_folds(
 
     while start + total_window <= n:
         train_days_range = uniq_days[start : start + train_days]
-        val_days_range   = uniq_days[start + train_days : start + train_days + val_days]
-        test_days_range  = uniq_days[start + train_days + val_days : start + total_window]
+        val_start = start + train_days + purge_days
+        val_end = val_start + val_days
+        test_start = val_end + purge_days
+        test_end = test_start + test_days
+
+        if test_end > n:
+            break
+
+        val_days_range   = uniq_days[val_start : val_end]
+        test_days_range  = uniq_days[test_start : test_end]
 
         day_series = dates  # already date
         train_mask = day_series.isin(train_days_range)

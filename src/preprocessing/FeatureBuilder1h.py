@@ -38,9 +38,6 @@ class Settings:
     sector_map_path: Path = Path(PROJECT_ROOT / "config/sector_mapping.json")
     use_sector_features: bool = True
     
-    # ラベルタイプ: "oc" (寄→引), "cc" (引→引), "oo" (寄→寄)
-    label_type: str = os.environ.get("LABEL_TYPE", "oc")
-
     # 何銘柄処理するか（0=全TOPIX、例: 50なら先頭50銘柄）
     limit_tickers: int = 0
 
@@ -51,7 +48,9 @@ class Settings:
     make_labels: bool = True
     
     # ラベルタイプ: "oc" (寄→引), "cc" (引→引), "oo" (寄→寄)
-    label_type: str = "oc"
+    label_type: str = os.environ.get("LABEL_TYPE", "cc")
+    # リスクラベル: "drawdown" | "abs_ret" | "intraday_range"
+    risk_label_type: str = os.environ.get("RISK_LABEL_TYPE", "drawdown")
 
     # 15:00バーを「その日の決定時刻」として切り出す
     decision_hour: int = 15
@@ -61,6 +60,10 @@ class Settings:
 
     # timezone
     tz: str = "Asia/Tokyo"
+
+    # cross-sectional normalization
+    add_cs_rank: bool = True
+    add_cs_zscore: bool = True
 
 
 # ---------------------------
@@ -76,7 +79,8 @@ class FeatureConfig:
     add_market: bool = True
     add_relative: bool = True
     make_labels: bool = True
-    label_type: str = "oc"
+    label_type: str = "cc"
+    risk_label_type: str = "drawdown"
 
 
 def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -382,18 +386,19 @@ def build_sector_proxy_data(
     return out[[dt_col, "ticker", "sector_ret", "sector_vol"]]
 
 
-def _make_daily_labels_from_hourly(df_ohlcv: pd.DataFrame, label_type: str = "oc") -> pd.DataFrame:
+def _make_daily_labels_from_hourly(
+    df_ohlcv: pd.DataFrame,
+    label_type: str = "oc",
+    risk_label_type: str = "drawdown",
+) -> pd.DataFrame:
     """
     ラベル定義（複数候補）:
-      label_type="oc": 寄→引
-        y_ret  = log(next_close / next_open)
-        y_risk = max(0, (next_open - next_low)/next_open)
-      label_type="cc": 引→引
-        y_ret  = log(next_close / current_close)
-        y_risk = max(0, (current_close - next_low)/current_close)
-      label_type="oo": 寄→寄
-        y_ret  = log(next_open / current_open)
-        y_risk = max(0, (current_open - next_low)/current_open)
+      y_ret は label_type で定義し、
+      y_risk は risk_label_type で定義する。
+      risk_label_type:
+        - drawdown: 下方ドローダウン（従来）
+        - abs_ret:  |y_ret|
+        - intraday_range: (next_high-next_low)/next_open
     """
     df = df_ohlcv.copy()
     df["date"] = df.index.date
@@ -408,28 +413,37 @@ def _make_daily_labels_from_hourly(df_ohlcv: pd.DataFrame, label_type: str = "oc
     daily["next_open"] = daily["open_"].shift(-1)
     daily["next_close"] = daily["close_"].shift(-1)
     daily["next_low"] = daily["low_"].shift(-1)
+    daily["next_high"] = daily["high_"].shift(-1)
 
     if label_type == "oc":
         # 翌日寄→引
         daily["y_ret"] = np.log((daily["next_close"] + EPS) / (daily["next_open"] + EPS))
-        daily["y_risk"] = np.maximum(
-            0.0, (daily["next_open"] - daily["next_low"]) / (daily["next_open"] + EPS)
-        )
     elif label_type == "cc":
         # 引→翌日引
         daily["y_ret"] = np.log((daily["next_close"] + EPS) / (daily["close_"] + EPS))
-        daily["y_risk"] = np.maximum(
-            0.0, (daily["close_"] - daily["next_low"]) / (daily["close_"] + EPS)
-        )
     elif label_type == "oo":
         # 寄→翌日寄
         daily["y_ret"] = np.log((daily["next_open"] + EPS) / (daily["open_"] + EPS))
-        daily["y_risk"] = np.maximum(
-            0.0, (daily["open_"] - daily["next_low"]) / (daily["open_"] + EPS)
-        )
     else:
         raise ValueError(f"Unknown label_type: {label_type}")
 
+    if risk_label_type == "drawdown":
+        if label_type == "oc":
+            base = daily["next_open"]
+        elif label_type == "cc":
+            base = daily["close_"]
+        else:
+            base = daily["open_"]
+        daily["y_risk"] = np.maximum(0.0, (base - daily["next_low"]) / (base + EPS))
+    elif risk_label_type == "abs_ret":
+        daily["y_risk"] = daily["y_ret"].abs()
+    elif risk_label_type == "intraday_range":
+        daily["y_risk"] = (daily["next_high"] - daily["next_low"]) / (daily["next_open"] + EPS)
+        daily["y_risk"] = daily["y_risk"].clip(lower=0.0)
+    else:
+        raise ValueError(f"Unknown risk_label_type: {risk_label_type}")
+
+    daily["y_risk"] = daily["y_risk"].replace([np.inf, -np.inf], np.nan).clip(lower=0.0)
     return daily[["y_ret", "y_risk"]]
 
 
@@ -470,7 +484,8 @@ def build_features_for_ticker(
     if cfg.make_labels:
         daily_labels = _make_daily_labels_from_hourly(
             df[["Open", "High", "Low", "Close", "Volume"]], 
-            label_type=cfg.label_type
+            label_type=cfg.label_type,
+            risk_label_type=cfg.risk_label_type,
         )
         df["date"] = df.index.date
         df = df.join(daily_labels, on="date")
@@ -523,6 +538,44 @@ def add_cross_sectional_ranks(df: pd.DataFrame, dt_col: str, cols: List[str]) ->
 
     for c in use_cols:
         df[f"cs_rank_{c}"] = df.groupby(dt_col)[c].rank(pct=True, method="average")
+
+    return df
+
+
+def add_cross_sectional_normalization(
+    df: pd.DataFrame,
+    dt_col: str,
+    exclude_cols: List[str],
+    add_rank: bool = True,
+    add_zscore: bool = True,
+) -> pd.DataFrame:
+    df = df.copy()
+    if not add_rank and not add_zscore:
+        return df
+
+    exclude = set(exclude_cols)
+    cols = [
+        c for c in df.columns
+        if c not in exclude
+        and pd.api.types.is_numeric_dtype(df[c])
+        and not c.startswith("cs_rank_")
+        and not c.startswith("cs_z_")
+    ]
+    if not cols:
+        return df
+
+    grp = df.groupby(dt_col, sort=False)
+
+    if add_rank:
+        for c in cols:
+            df[f"cs_rank_{c}"] = grp[c].rank(pct=True, method="average")
+
+    if add_zscore:
+        for c in cols:
+            mean = grp[c].transform("mean")
+            std = grp[c].transform("std").replace(0, np.nan)
+            z = (df[c] - mean) / std
+            df[f"cs_z_{c}"] = z.fillna(0.0)
 
     return df
 
@@ -585,6 +638,7 @@ def main() -> None:
         add_relative=True,
         make_labels=s.make_labels,
         label_type=s.label_type,
+        risk_label_type=s.risk_label_type,
     )
 
     universe_tables: List[pd.DataFrame] = []
@@ -635,59 +689,14 @@ def main() -> None:
         if dup_count > 0:
             raise ValueError(f"Duplicate rows detected after feature build: {dt_name}+ticker dup={dup_count}")
 
-        rank_cols = [
-            "logret_cc",
-            "ret_mean_24",
-            "ret_mean_56",
-            "ret_std_24",
-            "ret_std_56",
-            "dd_24",
-            "dd_56",
-            "rel_ret",
-            "rel_range",
-            "rel_vol",
-            "v_rel_8",
-            "v_rel_24",
-            "v_rel_56",
-            "volume_abs_mean_8",
-            "volume_abs_mean_24",
-            "volume_abs_mean_56",
-            "volume_z_8",
-            "volume_z_24",
-            "volume_z_56",
-            "volume_mom_8",
-            "volume_mom_24",
-            "volume_mom_56",
-            "rsi_8",
-            "rsi_24",
-            "rsi_56",
-            "macd_line",
-            "macd_signal",
-            "macd_hist",
-            "bb_z_8",
-            "bb_z_24",
-            "bb_z_56",
-            "bb_width_8",
-            "bb_width_24",
-            "bb_width_56",
-            "atr_pct_8",
-            "atr_pct_24",
-            "atr_pct_56",
-            "adx_8",
-            "adx_24",
-            "adx_56",
-            "obv_z_8",
-            "obv_z_24",
-            "obv_z_56",
-            "sector_ret",
-            "sector_rel_ret",
-            "sector_vol",
-            "sector_beta_24",
-            "sector_beta_56",
-            "sector_momentum_24",
-            "sector_momentum_56",
-        ]
-        uni_reset = add_cross_sectional_ranks(uni_reset, dt_name, rank_cols)
+        exclude_cols = [dt_name, "ticker", "y_ret", "y_risk"]
+        uni_reset = add_cross_sectional_normalization(
+            uni_reset,
+            dt_col=dt_name,
+            exclude_cols=exclude_cols,
+            add_rank=s.add_cs_rank,
+            add_zscore=s.add_cs_zscore,
+        )
         uni = uni_reset.set_index(dt_name)
         uni.index.name = dt_name
 

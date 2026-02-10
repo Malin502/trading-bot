@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import joblib
 import numpy as np
@@ -40,21 +40,37 @@ ARTIFACTS_ROOT = Path("artifacts/model1")
 N_RECENT_FOLDS = 5
 
 # アンサンブル方法: "mean" | "median" | "weighted_mean"
-ENSEMBLE_METHOD = "mean"
+ENSEMBLE_METHOD = "weighted_mean"
+
+# weighted_mean時の重み設定
+RECENCY_WEIGHT_POWER = 1.0
+FOLD_QUALITY_WEIGHT = True
+MIN_FOLD_QUALITY = 0.1
 
 # 不確実性でポジション縮小
-UNCERTAINTY_PERCENTILE = 0.75
-MIN_POSITION_SCALE = 0.3
+UNCERTAINTY_PERCENTILE = 0.80  # 上位20%のみ縮小（バランス型）
+MIN_POSITION_SCALE = 0.5       # 縮小時は50%に（中程度）
 
 # スコアリング（利益重視）
-SCORING_METHOD = "utility"  # "utility" | "sharpe_adj" | "cost_aware" | "simple"
-RISK_AVERSION = 1.0
-COST_BPS = 5.0
-SLIPPAGE_BPS = 3.0
+SCORING_METHOD = "ret_only"  # "ret_only" | "utility" | "sharpe_adj" | "cost_aware" | "simple"
+RISK_AVERSION = 0.5          # リターンとリスクのバランス（推奨: 0.3-0.7）
+COST_BPS = 5.0               # 取引コスト（実態に合わせる）
+SLIPPAGE_BPS = 3.0           # スリッページ
 
 # スコア設定
 EPS = 1e-6
 SCORE_CLIP = None  # 例: 50.0 / Noneで無効
+
+# 予測安定化
+RET_WINSOR_LOW_Q = 0.02
+RET_WINSOR_HIGH_Q = 0.98
+
+# リスク予測崩壊の検知（銘柄間差がほぼ無い場合）
+RISK_SPREAD_MIN = 0.02
+RISK_CV_MIN = 0.03
+
+# 保有継続ボーナス（回転率削減）
+HOLDING_BONUS_SCORE = 0.02  # 前日保有銘柄へのスコア加算（2%程度）
 
 # 出力先
 OUT_DIR = Path("artifacts/model1/inference")
@@ -106,6 +122,36 @@ def _load_fold_artifacts(fold_dir: Path):
     return feature_cols, scale_cols, scaler, state_dict
 
 
+def _build_model_from_state_dict(in_dim: int, state_dict: Dict[str, torch.Tensor]) -> Model1ResidualMLP:
+    """
+    学習時設定に依存せず、state_dictからwidth/depthを復元する。
+    """
+    w_key = "trunk.0.weight"
+    if w_key not in state_dict:
+        raise KeyError(f"missing key in state_dict: {w_key}")
+    width = int(state_dict[w_key].shape[0])
+    depth = sum(1 for k in state_dict.keys() if k.startswith("trunk.") and k.endswith("net.0.weight"))
+    if depth <= 0:
+        raise ValueError("could not infer residual depth from state_dict")
+    return Model1ResidualMLP(in_dim=in_dim, width=width, depth=depth, dropout=0.0)
+
+
+def _fold_quality_weight(fold_dir: Path, min_weight: float = 0.1) -> float:
+    metrics_path = fold_dir / "metrics.json"
+    if not metrics_path.exists():
+        return 1.0
+    try:
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        sharpe = float((metrics.get("val_backtest") or {}).get("sharpe_daily", 0.0))
+        rankic = float((metrics.get("val_backtest") or {}).get("rankic_mean", 0.0))
+        # バックテスト系の最小限スコア。負値は下限へ丸める。
+        quality = max(min_weight, 1.0 + sharpe + 0.5 * rankic)
+        return float(quality)
+    except Exception as e:
+        print(f"[WARN] fold quality parse failed for {fold_dir.name}: {e}")
+        return 1.0
+
+
 def _build_fold_inputs(
     df_today: pd.DataFrame,
     feature_cols: List[str],
@@ -146,24 +192,66 @@ def add_score(
     risk_aversion: float = 1.0,
     cost_bps: float = 5.0,
     slippage_bps: float = 3.0,
+    use_risk: bool = True,
 ) -> pd.DataFrame:
     out = df.copy()
     out["pred_risk_abs"] = out["pred_risk"].abs()
     total_cost = (cost_bps + slippage_bps) / 10000.0
 
-    if method == "utility":
-        score = out["pred_ret"] - risk_aversion * (out["pred_risk_abs"] ** 2) - total_cost
-    elif method == "sharpe_adj":
-        score = (out["pred_ret"] - total_cost) / (out["pred_risk_abs"] + eps) - 0.5 * out["pred_risk_abs"]
-    elif method == "cost_aware":
-        score = (out["pred_ret"] - total_cost) / (out["pred_risk_abs"] + eps)
+    if not use_risk:
+        score = out["pred_ret"] - total_cost
     else:
-        score = out["pred_ret"] / (out["pred_risk_abs"] + eps)
+        if method == "ret_only":
+            score = out["pred_ret"] - total_cost
+        elif method == "utility":
+            score = out["pred_ret"] - risk_aversion * (out["pred_risk_abs"] ** 2) - total_cost
+        elif method == "sharpe_adj":
+            score = (out["pred_ret"] - total_cost) / (out["pred_risk_abs"] + eps) - 0.5 * out["pred_risk_abs"]
+        elif method == "cost_aware":
+            score = (out["pred_ret"] - total_cost) / (out["pred_risk_abs"] + eps)
+        else:
+            score = out["pred_ret"] / (out["pred_risk_abs"] + eps)
 
     out["score"] = score
     if score_clip is not None and score_clip > 0:
         out["score"] = out["score"].clip(-score_clip, score_clip)
     return out
+
+
+def _is_risk_collapsed(df_pred: pd.DataFrame) -> bool:
+    risk = df_pred["pred_risk"].to_numpy(dtype=np.float64)
+    if len(risk) < 5:
+        return False
+    q95, q05 = np.nanquantile(risk, [0.95, 0.05])
+    spread = float(q95 - q05)
+    mean = float(np.nanmean(risk))
+    std = float(np.nanstd(risk))
+    cv = std / (abs(mean) + 1e-8)
+    collapsed = (spread < RISK_SPREAD_MIN) or (cv < RISK_CV_MIN)
+    print(f"[INFO] risk spread={spread:.6f}, cv={cv:.6f}, collapsed={collapsed}")
+    return collapsed
+
+
+def load_previous_holdings(latest_day: pd.Timestamp, topk: int = 5) -> set:
+    """前日の保有銘柄を取得（回転率削減用）"""
+    try:
+        prev_day = latest_day - pd.Timedelta(days=1)
+        # 営業日でない可能性があるので、過去10日分探索
+        for i in range(1, 11):
+            check_date = latest_day - pd.Timedelta(days=i)
+            prev_file = OUT_DIR / f"rank_{check_date.date()}.csv"
+            if prev_file.exists():
+                df_prev = pd.read_csv(prev_file)
+                if "score_adj" in df_prev.columns:
+                    holdings = set(df_prev.nlargest(topk, "score_adj")["ticker"].tolist())
+                elif "score" in df_prev.columns:
+                    holdings = set(df_prev.nlargest(topk, "score")["ticker"].tolist())
+                else:
+                    holdings = set(df_prev.head(topk)["ticker"].tolist())
+                return holdings
+    except Exception as e:
+        print(f"[WARN] Could not load previous holdings: {e}")
+    return set()
 
 
 # ============================
@@ -203,7 +291,7 @@ def main():
 
         X_final = _build_fold_inputs(df_today, feature_cols, scaler, scale_cols)
 
-        model = Model1ResidualMLP(in_dim=X_final.shape[1], width=256, depth=4, dropout=0.10)
+        model = _build_model_from_state_dict(in_dim=X_final.shape[1], state_dict=state_dict)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
@@ -245,20 +333,34 @@ def main():
 
     elif ENSEMBLE_METHOD == "weighted_mean":
         fold_ids_sorted = sorted(df_pred_all["fold_id"].unique())
-        weights = {fid: (i + 1) for i, fid in enumerate(fold_ids_sorted)}
-        df_pred_all["weight"] = df_pred_all["fold_id"].map(weights)
+        recency_weights = {fid: float((i + 1) ** RECENCY_WEIGHT_POWER) for i, fid in enumerate(fold_ids_sorted)}
+        quality_weights = {fid: 1.0 for fid in fold_ids_sorted}
+        if FOLD_QUALITY_WEIGHT:
+            fold_dir_map = {int(p.name.split("_")[1]): p for p in fold_dirs}
+            quality_weights = {
+                fid: _fold_quality_weight(fold_dir_map[fid], min_weight=MIN_FOLD_QUALITY)
+                for fid in fold_ids_sorted
+            }
 
-        df_pred_mean = (
-            df_pred_all
-            .groupby("ticker")
-            .apply(lambda g: pd.Series({
-                "pred_ret": (g["pred_ret"] * g["weight"]).sum() / g["weight"].sum(),
-                "pred_risk": (g["pred_risk"] * g["weight"]).sum() / g["weight"].sum(),
-                "pred_ret_std": g["pred_ret"].std(),
-                "pred_risk_std": g["pred_risk"].std(),
-            }))
-            .reset_index()
+        weights = {fid: recency_weights[fid] * quality_weights[fid] for fid in fold_ids_sorted}
+        print(f"[INFO] fold weights: {weights}")
+
+        df_pred_all["weight"] = df_pred_all["fold_id"].map(weights).astype(float)
+        df_pred_all["weighted_ret"] = df_pred_all["pred_ret"] * df_pred_all["weight"]
+        df_pred_all["weighted_risk"] = df_pred_all["pred_risk"] * df_pred_all["weight"]
+
+        grouped = df_pred_all.groupby("ticker")
+        sum_w = grouped["weight"].sum().rename("sum_w")
+        wret = grouped["weighted_ret"].sum().rename("sum_wret")
+        wrisk = grouped["weighted_risk"].sum().rename("sum_wrisk")
+        std_df = grouped.agg(
+            pred_ret_std=("pred_ret", "std"),
+            pred_risk_std=("pred_risk", "std"),
         )
+        df_pred_mean = pd.concat([sum_w, wret, wrisk, std_df], axis=1).reset_index()
+        df_pred_mean["pred_ret"] = df_pred_mean["sum_wret"] / df_pred_mean["sum_w"].clip(lower=1e-8)
+        df_pred_mean["pred_risk"] = df_pred_mean["sum_wrisk"] / df_pred_mean["sum_w"].clip(lower=1e-8)
+        df_pred_mean = df_pred_mean.drop(columns=["sum_w", "sum_wret", "sum_wrisk"])
 
     elif ENSEMBLE_METHOD == "median":
         df_pred_mean = df_pred_all.groupby("ticker").agg({
@@ -278,6 +380,15 @@ def main():
 
     else:
         raise ValueError(f"Unknown ENSEMBLE_METHOD: {ENSEMBLE_METHOD}")
+
+    # 極端予測の抑制（クロスセクションwinsorize）
+    if RET_WINSOR_LOW_Q is not None and RET_WINSOR_HIGH_Q is not None:
+        lo, hi = df_pred_mean["pred_ret"].quantile([RET_WINSOR_LOW_Q, RET_WINSOR_HIGH_Q]).tolist()
+        df_pred_mean["pred_ret_raw"] = df_pred_mean["pred_ret"]
+        df_pred_mean["pred_ret"] = df_pred_mean["pred_ret"].clip(lo, hi)
+        print(f"[INFO] pred_ret winsorize: q{RET_WINSOR_LOW_Q:.2f}={lo:.6f}, q{RET_WINSOR_HIGH_Q:.2f}={hi:.6f}")
+
+    risk_collapsed = _is_risk_collapsed(df_pred_mean)
 
     df_pred_mean["pred_uncertainty"] = (
         df_pred_mean["pred_ret_std"] / (df_pred_mean["pred_ret"].abs() + 1e-3)
@@ -301,7 +412,20 @@ def main():
         risk_aversion=RISK_AVERSION,
         cost_bps=COST_BPS,
         slippage_bps=SLIPPAGE_BPS,
+        use_risk=not risk_collapsed,
     )
+    out["score_method_used"] = "ret_only" if risk_collapsed else SCORING_METHOD
+    
+    # 保有継続ボーナスを追加（回転率削減）
+    prev_holdings = load_previous_holdings(pd.Timestamp(latest_day), topk=5)
+    if prev_holdings:
+        print(f"[INFO] Previous holdings: {prev_holdings}")
+        out["holding_bonus"] = out["ticker"].apply(lambda x: HOLDING_BONUS_SCORE if x in prev_holdings else 0.0)
+        out["score"] = out["score"] + out["holding_bonus"]
+    else:
+        out["holding_bonus"] = 0.0
+        print("[WARN] No previous holdings found, skipping holding bonus")
+    
     out["score_adj"] = out["score"] * out["position_scale"]
     out = out.sort_values("score_adj", ascending=False).reset_index(drop=True)
 
